@@ -1,0 +1,6 @@
+pushd
+popd
+dirs
+history
+!!
+cd /home/exp
