@@ -1,0 +1,522 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <dirent.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <fnmatch.h>  // fnmatch関数を使用するために追加
+
+#define BUFLEN 1024
+#define MAXARGNUM 256
+#define MAX_HISTORY 32
+#define MAX_COMMAND_LEN 256
+#define MAX_EXPANDED_COMMAND_LEN 4096
+#define MAX_ALIASES 100
+#define DEFAULT_PROMPT "Command : "
+#define MAX_DIRS 100
+#define MAX_PATH_LEN 1024
+#define MAXLENGTH 256
+
+char history[MAX_HISTORY][MAX_COMMAND_LEN];
+int history_count = 0;
+char prompt[MAX_COMMAND_LEN] = DEFAULT_PROMPT;
+
+typedef struct {
+    char alias[MAX_COMMAND_LEN];
+    char command[MAX_COMMAND_LEN];
+} Alias;
+
+Alias aliases[MAX_ALIASES];
+int alias_count = 0;
+
+void add_to_history(const char *command) {
+    if (history_count < MAX_HISTORY) {
+        strcpy(history[history_count], command);
+        history_count++;
+    } else {
+        for (int i = 1; i < MAX_HISTORY; i++) {
+            strcpy(history[i - 1], history[i]);
+        }
+        strcpy(history[MAX_HISTORY - 1], command);
+    }
+}
+
+void show_history() {
+    for (int i = 0; i < history_count; i++) {
+        printf("%d: %s\n", i + 1, history[i]);
+    }
+}
+
+void cd(int argc, char *argv[]) {
+    const char *dir;
+    if (argc == 1) {
+        dir = getenv("HOME");
+        if (dir == NULL) {
+            fprintf(stderr, "HOME environment variable is not set.\n");
+            return;
+        }
+    } else if (argc == 2) {
+        dir = argv[1];
+    } else {
+        fprintf(stderr, "Usage: %s [directory]\n", argv[0]);
+        return;
+    }
+
+    if (chdir(dir) != 0) {
+        perror("chdir");
+    } else {
+        printf("Changed directory to %s\n", dir);
+    }
+}
+
+void cat(int argc, char *argv[]) {
+    for (int i = 1; i < argc; i++) {
+        char cc;
+        FILE *file1; // ファイルポインタの宣言
+
+        file1 = fopen(argv[i], "r"); // ファイルのオープン
+
+        if (file1 == NULL) { // ファイルがオープンできたどうかの確認
+            fprintf(stderr, "%s is not found.\n", argv[i]);
+            continue;
+        }
+
+        while ((cc = getc(file1)) != EOF) { // ファイルの終りまで読み込むためのループ
+            if (cc == 10 || cc >= 32) {
+                putchar(cc); // 文字の出力
+            }
+        }
+
+        fclose(file1); // ファイルのクローズ
+    }
+}
+
+char* dir_stack[MAX_DIRS];
+int stack_top = -1;
+
+void pushd() {
+    char cwd[MAX_PATH_LEN];
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        perror("getcwd");
+        exit(EXIT_FAILURE);
+    }
+
+    if (stack_top >= MAX_DIRS - 1) {
+        fprintf(stderr, "Directory stack is full\n");
+        return;
+    }
+
+    dir_stack[++stack_top] = strdup(cwd);
+    if (dir_stack[stack_top] == NULL) {
+        perror("strdup");
+        exit(EXIT_FAILURE);
+    }
+
+    printf("Directory pushed: %s\n", dir_stack[stack_top]);
+}
+
+void dirs() {
+    if (stack_top == -1) {
+        printf("Directory stack is empty\n");
+        return;
+    }
+
+    printf("Directory stack:\n");
+    for (int i = stack_top; i >= 0; --i) {
+        printf("%d: %s\n", i, dir_stack[i]);
+    }
+}
+
+void popd() {
+    if (stack_top == -1) {
+        printf("Directory stack is empty\n");
+        return;
+    }
+
+    char *dir_to_change = dir_stack[stack_top];
+    if (chdir(dir_to_change) != 0) {
+        perror("chdir");
+        return;
+    }
+
+    printf("Changed directory to: %s\n", dir_to_change);
+
+    free(dir_stack[stack_top]);
+    stack_top--;
+}
+
+void execute_script(FILE *script) {
+    char line[MAX_COMMAND_LEN];
+    char *argv[256];
+    int argc=0;
+    while (fgets(line, sizeof(line), script) != NULL) {
+        line[strlen(line)-1] = '\0';
+
+        if (strcmp("exit", line) == 0) {
+            printf("the end\n");
+            return;
+        }
+
+        char *tp;
+        tp = strtok(line, " ");
+        while (tp != NULL) {
+            argv[argc] = tp;
+            argc++;
+            tp = strtok(NULL, " ");
+        }
+        argv[argc]=NULL;
+
+        main_command(argv);
+        argc=0;
+    }
+}
+
+void execute_external_command(char *argv[], int background) {
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        return;
+    }
+    if (pid == 0) {
+        if (execvp(argv[0], argv) == -1) {
+            perror("execvp");
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        if (!background) {
+            int status;
+            waitpid(pid, &status, 0);
+        }
+    }
+}
+
+void expand_wildcards(char *argv[], char *new_argv[], int *new_argc) {
+    int i, j;
+    *new_argc = 0;
+    for (i = 0; argv[i] != NULL; i++) {
+        if (strcmp(argv[i], "*") == 0) {
+            DIR *dir;
+            struct dirent *entry;
+            dir = opendir(".");
+            if (dir == NULL) {
+                perror("opendir");
+                exit(EXIT_FAILURE);
+            }
+            while ((entry = readdir(dir)) != NULL) {
+                if (entry->d_name[0] != '.') {
+                    new_argv[*new_argc] = strdup(entry->d_name);
+                    (*new_argc)++;
+                }
+            }
+            closedir(dir);
+        } else if (strchr(argv[i], '*') != NULL) {
+            char *pattern = argv[i];
+            DIR *dir;
+            struct dirent *entry;
+            dir = opendir(".");
+            if (dir == NULL) {
+                perror("opendir");
+                exit(EXIT_FAILURE);
+            }
+            while ((entry = readdir(dir)) != NULL) {
+                if (entry->d_name[0] != '.' && fnmatch(pattern, entry->d_name, 0) == 0) {
+                    new_argv[*new_argc] = strdup(entry->d_name);
+                    (*new_argc)++;
+                }
+            }
+            closedir(dir);
+        } else {
+            new_argv[*new_argc] = argv[i];
+            (*new_argc)++;
+        }
+    }
+    new_argv[*new_argc] = NULL;
+}
+
+void execute_command_starting_with(const char *prefix) {
+    for (int i = history_count - 1; i >= 0; i--) {
+        if (strncmp(history[i], prefix, strlen(prefix)) == 0) {
+            char *argv[256];
+            const char *matched_command = history[i];
+            printf("%s\n", matched_command);
+            int argc = 0;
+            char command_copy[MAX_COMMAND_LEN];
+            strcpy(command_copy, history[i]);
+
+            char *tp = strtok(command_copy, " ");
+            while (tp != NULL) {
+                argv[argc] = tp;
+                argc++;
+                tp = strtok(NULL, " ");
+            }
+            argv[argc] = NULL;
+
+            main_command(argv);
+            return;
+        }
+    }
+    printf("No command starts with '%s'.\n", prefix);
+}
+
+void execute_command_by_number(int n) {
+    if (n < 1 || n > history_count) {
+        printf("No such command in history: %d\n", n);
+        return;
+    }
+    const char *command = history[n - 1];
+    printf("%s\n", command);
+
+    char *argv[256];
+    int argc = 0;
+    char command_copy[MAX_COMMAND_LEN];
+    strcpy(command_copy, command);
+
+    char *tp = strtok(command_copy, " ");
+    while (tp != NULL) {
+        argv[argc] = tp;
+        argc++;
+        tp = strtok(NULL, " ");
+    }
+    argv[argc] = NULL;
+
+    main_command(argv);
+}
+
+void execute_command_relative(int n) {
+    if (n < 1 || n > history_count) {
+        printf("No such command in history: -%d\n", n);
+        return;
+    }
+    int index = history_count - n;
+    execute_command_by_number(index + 1);
+}
+
+void execute_last_command() {
+    if (history_count > 0) {
+        const char *last_command = history[history_count - 1];
+        printf("%s\n", last_command);
+
+        char *argv[256];
+        int argc = 0;
+        char command_copy[MAX_COMMAND_LEN];
+        strcpy(command_copy, last_command);
+
+        char *tp = strtok(command_copy, " ");
+        while (tp != NULL) {
+            argv[argc] = tp;
+            argc++;
+            tp = strtok(NULL, " ");
+        }
+        argv[argc] = NULL;
+
+        main_command(argv);
+    } else {
+        printf("No commands in history.\n");
+    }
+}
+
+void set_alias(const char *alias, const char *command) {
+    for (int i = 0; i < alias_count; i++) {
+        if (strcmp(aliases[i].alias, alias) == 0) {
+            strcpy(aliases[i].command, command);
+            return;
+        }
+    }
+    if (alias_count < MAX_ALIASES) {
+        strcpy(aliases[alias_count].alias, alias);
+        strcpy(aliases[alias_count].command, command);
+        alias_count++;
+    } else {
+        printf("Alias limit reached.\n");
+    }
+}
+
+void remove_alias(const char *alias) {
+    for (int i = 0; i < alias_count; i++) {
+        if (strcmp(aliases[i].alias, alias) == 0) {
+            for (int j = i; j < alias_count - 1; j++) {
+                aliases[j] = aliases[j + 1];
+            }
+            alias_count--;
+            return;
+        }
+    }
+    printf("Alias not found: %s\n", alias);
+}
+
+void show_aliases() {
+    for (int i = 0; i < alias_count; i++) {
+        printf("%s\t%s\n", aliases[i].alias, aliases[i].command);
+    }
+}
+
+
+void main_command(char *argv[]){
+    if (strcmp(argv[0], "!!") != 0 && strncmp(argv[0], "!", 1) != 0) {
+        char full_command[MAX_COMMAND_LEN] = "";
+        for (int i = 0; argv[i] != NULL; i++) {
+            if (i > 0) {
+                strcat(full_command, " ");
+            }
+            strcat(full_command, argv[i]);
+        }
+        add_to_history(full_command);
+    }
+
+    for (int i = 0; i < alias_count; i++) {
+        if (strcmp(argv[0], aliases[i].alias) == 0) {
+            char *token;
+            char temp[MAX_COMMAND_LEN];
+            strcpy(temp, aliases[i].command);
+            int argc = 0;
+            char *alias_argv[MAXARGNUM];
+
+            token = strtok(temp, " ");
+            while (token != NULL) {
+                alias_argv[argc++] = token;
+                token = strtok(NULL, " ");
+            }
+            alias_argv[argc] = NULL;
+
+            for (int j = 1; argv[j] != NULL; j++) {
+                alias_argv[argc++] = argv[j];
+            }
+            alias_argv[argc] = NULL;
+
+            for (int k = 0; alias_argv[k] != NULL; k++) {
+                argv[k] = alias_argv[k];
+            }
+            argv[argc] = NULL;
+            break;
+        }
+    }
+
+    char *j_argv[MAXARGNUM];
+    int n_argc;
+    expand_wildcards(argv, j_argv, &n_argc);
+
+    int background = 0;
+    if (n_argc > 1 && strcmp(j_argv[n_argc - 1], "&") == 0) {
+        background = 1;
+        j_argv[n_argc - 1] = NULL;
+    }
+
+    if (strcmp(j_argv[0], "cat") == 0) {
+        if (j_argv[1] != NULL) {
+            cat(n_argc, j_argv);
+        } else {
+            fprintf(stderr, "Usage: cat [filename]\n");
+        }
+    }
+    else if (strcmp(j_argv[0], "cd") == 0) {
+        cd(n_argc, j_argv);
+    }
+    else if (strcmp(j_argv[0], "pushd") == 0) {
+        pushd();
+    }
+    else if (strcmp(j_argv[0], "dirs") == 0) {
+        dirs();
+    }
+    else if (strcmp(j_argv[0], "popd") == 0) {
+        popd();
+    }
+    else if (strcmp(j_argv[0], "history") == 0) {
+        show_history();
+    }
+    else if (strcmp(j_argv[0], "!!") == 0) {
+        execute_last_command();
+    }
+    else if (j_argv[0][0] == '!' && j_argv[0][1] != '!' && strlen(j_argv[0]) > 1) {
+        if (isdigit(j_argv[0][1])) {
+            int n = atoi(&j_argv[0][1]);
+            execute_command_by_number(n);
+        } else if (j_argv[0][1] == '-') {
+            int n = atoi(&j_argv[0][2]);
+            execute_command_relative(n);
+        } else {
+            execute_command_starting_with(&j_argv[0][1]);
+        }
+    }
+    else if (strcmp(j_argv[0], "prompt") == 0) {
+        if (j_argv[1] != NULL) {
+            char new_prompt[MAX_COMMAND_LEN] = "";
+            for (int i = 1; j_argv[i] != NULL; i++) {
+                if (i > 1) {
+                    strcat(new_prompt, " ");
+                }
+                strcat(new_prompt, j_argv[i]);
+            }
+            strcpy(prompt, new_prompt);
+        } else {
+            strcpy(prompt, DEFAULT_PROMPT);
+        }
+    }
+    else if (strcmp(j_argv[0], "alias") == 0) {
+        if (j_argv[1] == NULL) {
+            show_aliases();
+        } else if (j_argv[2] != NULL) {
+            set_alias(j_argv[1], j_argv[2]);
+        } else {
+            fprintf(stderr, "Usage: alias [alias_name command]\n");
+        }
+    }
+    else if (strcmp(j_argv[0], "unalias") == 0) {
+        if (j_argv[1] != NULL) {
+            remove_alias(j_argv[1]);
+        }
+    }
+    else {
+        execute_external_command(j_argv, background);
+    }
+}
+
+int main(int scr1, char *argv[256]) {
+    if (scr1 > 1) {
+        FILE *script = fopen(argv[1], "r");
+        if (script == NULL) {
+            perror("fopen");
+            return 1;
+        }
+
+        execute_script(script);
+        fclose(script);
+        return 0;
+    }
+
+    for (;;) {
+        char line[MAXLENGTH];
+        int argc = 0;
+        printf("%s", prompt);
+        while (fgets(line, sizeof(line), stdin) != NULL) {
+            line[strlen(line) - 1] = '\0';
+            if (strlen(line) == 0) {
+                continue;
+            }
+
+            if (strcmp("exit", line) == 0) {
+                printf("the end\n");
+                return 0;
+            }
+
+            char *tp;
+            tp = strtok(line, " ");
+            while (tp != NULL) {
+                argv[argc] = tp;
+                argc++;
+                tp = strtok(NULL, " ");
+            }
+            argv[argc] = NULL;
+
+            main_command(argv);
+            argc = 0;
+            printf("%s", prompt);
+        }
+    }
+
+    for (int i = 0; i <= stack_top; ++i) {
+        free(dir_stack[i]);
+    }
+    return 0;
+}

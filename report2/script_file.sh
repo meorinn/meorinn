@@ -1,0 +1,4 @@
+echo Hello
+ls
+alias ll ls -l
+history
